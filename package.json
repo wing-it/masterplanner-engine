@@ -1,0 +1,41 @@
+{
+  "name": "@masterplanner/engine",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Factory production calculation engine: a serializable production graph in, balanced machine counts, rates, and power out. No app, UI, or storage dependencies.",
+  "keywords": [
+    "satisfactory",
+    "production-planner",
+    "factory-calculator",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "winget86",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/winget86/masterplanner-engine.git"
+  },
+  "homepage": "https://github.com/winget86/masterplanner-engine#readme",
+  "bugs": {
+    "url": "https://github.com/winget86/masterplanner-engine/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}
