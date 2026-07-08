@@ -442,6 +442,62 @@ function addAvailableInput(
   return true;
 }
 
+/**
+ * Applies a signed delta to a node's available input for an item, returning
+ * whether the stored total changed meaningfully. Unlike `addAvailableInput`
+ * this accepts negative deltas (a re-propagation whose split shrank this edge's
+ * share) and never accumulates stale contributions: the seed pass tracks each
+ * edge's last contribution and only ever applies the difference, so a node
+ * re-processed with a grown output replaces rather than double-counts.
+ */
+function applyAvailableInputDelta(
+  availableInputs: Map<NodeId, Map<string, number>>,
+  nodeId: NodeId,
+  itemId: string,
+  delta: number
+): boolean {
+  if (Math.abs(delta) <= DEFAULT_EPSILON) return false;
+  const nodeInputs = availableInputs.get(nodeId);
+  if (!nodeInputs) return false;
+
+  for (const [key, value] of nodeInputs.entries()) {
+    if (itemsMatch(key, itemId)) {
+      const next = Math.max(0, value + delta);
+      if (Math.abs(next - value) <= DEFAULT_EPSILON) return false;
+      nodeInputs.set(key, next);
+      return true;
+    }
+  }
+
+  const next = Math.max(0, delta);
+  if (next <= DEFAULT_EPSILON) return false;
+  nodeInputs.set(itemId, next);
+  return true;
+}
+
+/** Signed-delta counterpart to `addDemand` (see `applyAvailableInputDelta`). */
+function applyDemandDelta(
+  demands: Map<NodeId, Map<string, number>>,
+  nodeId: NodeId,
+  itemId: string,
+  delta: number
+): void {
+  if (Math.abs(delta) <= DEFAULT_EPSILON) return;
+  const nodeDemand = demands.get(nodeId);
+  if (!nodeDemand) return;
+
+  for (const [key, value] of nodeDemand.entries()) {
+    if (itemsMatch(key, itemId)) {
+      nodeDemand.set(key, Math.max(0, value + delta));
+      return;
+    }
+  }
+
+  const next = Math.max(0, delta);
+  if (next <= DEFAULT_EPSILON) return;
+  nodeDemand.set(itemId, next);
+}
+
 function readAvailableInput(available: ReadonlyMap<string, number>, itemId: string): number {
   if (available.has(itemId)) return available.get(itemId)!;
   for (const [key, value] of available.entries()) {
@@ -1341,6 +1397,13 @@ function seedSupplyDrivenDemand(
 
   const availableInputs = new Map<NodeId, Map<string, number>>();
   const recipeOutputs = new Map<NodeId, Record<string, number>>();
+  // Last rate this pass propagated along each outgoing edge / recorded as a
+  // terminal recipe's own surplus demand. Propagation applies the delta since
+  // the last value so re-processing a node with a grown output replaces its
+  // prior contribution instead of double-counting it (a maximize recipe fed
+  // through a pool can be dequeued at partial supply, then again at full).
+  const edgeContribution = new Map<string, number>();
+  const selfDemandContribution = new Map<string, number>();
   const queue: NodeId[] = [];
   const queued = new Set<NodeId>();
 
@@ -1456,7 +1519,10 @@ function seedSupplyDrivenDemand(
       const outgoing = (normalized.outgoingEdgesByNode.get(node.id) ?? []).filter((edge) => itemsMatch(edge.itemId, itemId));
       if (outgoing.length === 0 && node.kind === 'recipe') {
         if (node.machineCountOverride == null && node.productionRateOverride == null) {
-          addDemand(demands, node.id, itemId, rate);
+          const selfKey = `${node.id}:${itemId}`;
+          const previous = selfDemandContribution.get(selfKey) ?? 0;
+          applyDemandDelta(demands, node.id, itemId, rate - previous);
+          selfDemandContribution.set(selfKey, rate);
         }
         continue;
       }
@@ -1472,12 +1538,15 @@ function seedSupplyDrivenDemand(
       );
       for (const edge of outgoing) {
         const splitRate = allocations.get(edge.id) ?? 0;
+        const delta = splitRate - (edgeContribution.get(edge.id) ?? 0);
+        if (Math.abs(delta) <= DEFAULT_EPSILON) continue;
+        edgeContribution.set(edge.id, splitRate);
         const target = normalized.nodesById.get(edge.targetId);
         if (target?.kind === 'sink' && target.demandPerMin == null) {
-          addDemand(demands, target.id, edge.itemId, splitRate);
+          applyDemandDelta(demands, target.id, edge.itemId, delta);
           continue;
         }
-        if (addAvailableInput(availableInputs, edge.targetId, edge.itemId, splitRate)) {
+        if (applyAvailableInputDelta(availableInputs, edge.targetId, edge.itemId, delta)) {
           enqueue(edge.targetId);
         }
       }

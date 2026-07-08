@@ -91,3 +91,82 @@ describe('maximizeOutput pinned through a pool with an unseeded intermediate inp
     expect(fuelMachines).toBeLessThan(61);
   });
 });
+
+/**
+ * Owner-reported (iron plate factory): three bounded factories each maximize
+ * an iron-ingot recipe and pool their output into a plain (non-maximize)
+ * downstream recipe with no further consumer — its machine count is sized
+ * purely from whatever supply arrives. With two pooled sources this sizes
+ * correctly; adding a third inflates the downstream recipe to more than 2x
+ * the pooled supply that actually exists.
+ */
+describe('plain recipe pooling three unequal maximize sources', () => {
+  function data() {
+    return gameData([
+      recipe({ id: 'ingot-recipe', durationSeconds: 1, inputs: [{ itemId: 'ore', amount: 1 }], outputs: [{ itemId: 'ingot', amount: 1 }] }),
+      recipe({ id: 'plate-recipe', durationSeconds: 6, inputs: [{ itemId: 'ingot', amount: 3 }], outputs: [{ itemId: 'plate', amount: 2 }] }),
+    ]);
+  }
+
+  /**
+   * Each ingot factory's ore ceiling comes from its own ore claims. When a
+   * factory has multiple claims (mirroring the real Factory 1 = 2 claims,
+   * Factory 3 = 3 claims), those claims are pooled internally into the
+   * factory's own smelter recipe (same poolFactoryInputs mechanism the app
+   * applies to the outer ingot pool) — an inner pool feeding a maximize
+   * recipe that itself feeds the outer pool. A single-element claims array
+   * (Factory 2) stays a plain direct edge, no inner pool.
+   */
+  function graph(claimsPerFactory: number[][]): ProductionGraph {
+    const nodes: ProductionGraph['nodes'] = [];
+    const edges: ProductionGraph['edges'] = [];
+
+    claimsPerFactory.forEach((claims, factoryIndex) => {
+      const ingotId = `ingot${factoryIndex + 1}`;
+      nodes.push({ kind: 'recipe', id: ingotId, recipeId: 'ingot-recipe', maximizeOutput: true });
+
+      if (claims.length === 1) {
+        const oreId = `o${factoryIndex + 1}`;
+        nodes.push({ kind: 'source', id: oreId, itemId: 'ore', sourceType: 'resource-claim', maxRatePerMin: claims[0]!, machineCountOverride: 1 });
+        edges.push({ id: `${oreId}${ingotId}`, sourceId: oreId, targetId: ingotId, itemId: 'ore' });
+      } else {
+        const orePoolId = `pool:ore${factoryIndex + 1}`;
+        nodes.push({ kind: 'pool', id: orePoolId, itemId: 'ore' });
+        claims.forEach((rate, claimIndex) => {
+          const oreId = `o${factoryIndex + 1}_${claimIndex + 1}`;
+          nodes.push({ kind: 'source', id: oreId, itemId: 'ore', sourceType: 'resource-claim', maxRatePerMin: rate, machineCountOverride: 1 });
+          edges.push({ id: `${oreId}pool`, sourceId: oreId, targetId: orePoolId, itemId: 'ore' });
+        });
+        edges.push({ id: `${orePoolId}${ingotId}`, sourceId: orePoolId, targetId: ingotId, itemId: 'ore' });
+      }
+
+      edges.push({ id: `${ingotId}pool`, sourceId: ingotId, targetId: 'pool:ingot', itemId: 'ingot' });
+    });
+
+    nodes.push({ kind: 'pool', id: 'pool:ingot', itemId: 'ingot' });
+    nodes.push({ kind: 'recipe', id: 'plate', recipeId: 'plate-recipe' });
+    edges.push({ id: 'poolplate', sourceId: 'pool:ingot', targetId: 'plate', itemId: 'ingot' });
+
+    return { schemaVersion: 2, nodes, edges };
+  }
+
+  it('sizes the downstream recipe from exactly the pooled supply with two sources', () => {
+    // Factory 1: 2 pooled ore claims (45 + 45 = 90). Factory 2: 1 direct claim (60).
+    const { result } = solveProductionGraph(graph([[45, 45], [60]]), data());
+
+    // 90 + 60 = 150 pooled ingots -> 150 * 2/3 = 100 plate/min.
+    expect(result.nodes.plate?.inputs).toContainEqual({ itemId: 'ingot', ratePerMin: 150 });
+    expect(result.nodes.plate?.outputs).toContainEqual({ itemId: 'plate', ratePerMin: 100 });
+  });
+
+  it('does not inflate the downstream recipe past the pooled supply with three sources', () => {
+    // Factory 1: 2 pooled claims (90). Factory 2: 1 direct claim (60).
+    // Factory 3: 3 pooled claims (50*3 = 150) -- mirrors the owner's report exactly.
+    const { result } = solveProductionGraph(graph([[45, 45], [60], [50, 50, 50]]), data());
+
+    // 90 + 60 + 150 = 300 pooled ingots -> 300 * 2/3 = 200 plate/min.
+    // The bug produced ~2.125x this (matching the owner-reported factor).
+    expect(result.nodes.plate?.inputs).toContainEqual({ itemId: 'ingot', ratePerMin: 300 });
+    expect(result.nodes.plate?.outputs).toContainEqual({ itemId: 'plate', ratePerMin: 200 });
+  });
+});
