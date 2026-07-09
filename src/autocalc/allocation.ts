@@ -91,12 +91,59 @@ function byproductEdgeCap(
   return supply * (Math.max(0, ownWeight) / totalWeight);
 }
 
+/**
+ * Fixed-plan demand attributed to a single edge, mirroring the demand pass's
+ * same-item fan-in split (getBranchDemandFromPlan). Used to net a shared
+ * source's reserved outflow out of its advertised capacity below.
+ */
+function fixedBranchDemand(
+  edge: ProductionEdge,
+  normalized: NormalizedGraph,
+  fixedRequiredPlan: RequiredPlan
+): number {
+  const targetPlan = fixedRequiredPlan[edge.targetId];
+  if (!targetPlan) return 0;
+  const targetDemand = getRecordValue(targetPlan.requiredInputs, edge.itemId);
+  if (targetDemand <= DEFAULT_EPSILON) return 0;
+  const fanIn = (normalized.incomingEdgesByNode.get(edge.targetId) ?? []).filter((candidate) =>
+    itemsMatch(candidate.itemId, edge.itemId)
+  ).length;
+  return fanIn > 0 ? targetDemand / fanIn : targetDemand;
+}
+
+/**
+ * Supply a source can actually deliver along `edge` for the fan's water-fill:
+ * its full output minus the demand it must reserve for its OTHER outgoing edges
+ * that feed fixed-demand consumers. Without the netting, a source shared
+ * between this pool and a fixed sibling (e.g. an override machine count)
+ * advertises its whole output here; the share it cannot deliver is then never
+ * redistributed to siblings that still have spare capacity, leaving the pool
+ * under-filled (each unshared sibling capped at an even split it never needed).
+ */
+function elasticEdgeCapacity(
+  edge: ProductionEdge,
+  normalized: NormalizedGraph,
+  actualPlan: ActualPlan,
+  fixedRequiredPlan?: RequiredPlan
+): number {
+  const source = normalized.nodesById.get(edge.sourceId);
+  if (!source || (source.kind !== 'source' && source.kind !== 'recipe')) return 0;
+  const total = getNodeOutputRate(source, actualPlan, edge.itemId);
+  if (!fixedRequiredPlan) return total;
+
+  const committedElsewhere = (normalized.outgoingEdgesByNode.get(source.id) ?? [])
+    .filter((other) => other.id !== edge.id && itemsMatch(other.itemId, edge.itemId))
+    .reduce((sum, other) => sum + fixedBranchDemand(other, normalized, fixedRequiredPlan), 0);
+  return Math.max(0, total - committedElsewhere);
+}
+
 function getEdgeDemand(
   edge: ProductionEdge,
   normalized: NormalizedGraph,
   requiredPlan: RequiredPlan,
   actualPlan: ActualPlan,
-  gameData: EngineGameData
+  gameData: EngineGameData,
+  fixedRequiredPlan?: RequiredPlan
 ): number {
   const targetPlan = requiredPlan[edge.targetId];
   if (!targetPlan) return 0;
@@ -139,11 +186,9 @@ function getEdgeDemand(
     if (elasticInTier.length > 0) {
       const allocated = remaining;
       remaining = 0;
-      const capacities = elasticInTier.map((elEdge) => {
-        const source = normalized.nodesById.get(elEdge.sourceId);
-        if (!source || (source.kind !== 'source' && source.kind !== 'recipe')) return 0;
-        return getNodeOutputRate(source, actualPlan, elEdge.itemId);
-      });
+      const capacities = elasticInTier.map((elEdge) =>
+        elasticEdgeCapacity(elEdge, normalized, actualPlan, fixedRequiredPlan)
+      );
       const totalCapacity = capacities.reduce((sum, capacity) => sum + capacity, 0);
 
       if (elasticInTier.length > 1 && totalCapacity > DEFAULT_EPSILON) {
@@ -594,7 +639,7 @@ function allocateOutgoingEdgesInternal(params: {
     if (edge.routing?.overflow) {
       return { [edge.id]: Math.max(0, params.actualSupply) };
     }
-    const demand = getEdgeDemand(edge, params.normalized, params.requiredPlan, params.actualPlan, params.gameData);
+    const demand = getEdgeDemand(edge, params.normalized, params.requiredPlan, params.actualPlan, params.gameData, params.fixedRequiredPlan);
     return { [edge.id]: Math.min(Math.max(0, params.actualSupply), demand) };
   }
 
@@ -788,7 +833,7 @@ export function allocateActualFlows(
         });
 
         for (const edge of itemEdges) {
-          const demandedRate = getEdgeDemand(edge, normalized, requiredPlan, actualPlan, gameData);
+          const demandedRate = getEdgeDemand(edge, normalized, requiredPlan, actualPlan, gameData, options.fixedRequiredPlan);
           const allocation = allocations[edge.id] ?? 0;
           edgeRates[edge.id] = allocation;
           result[edge.id] = {
