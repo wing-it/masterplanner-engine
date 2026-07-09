@@ -491,6 +491,15 @@ function allocateRedistribute(params: {
 
   const pulls = params.itemEdges.map((edge) => {
     const floor = floors.get(edge.id) ?? 0;
+    // Only a branch that wants MORE than its reserved fixed floor is elastic
+    // (maximize-driven) and keeps an unbounded appetite for the post-floor
+    // remainder. A purely fixed branch is capped at its demand, so once its
+    // floor already covers that demand it draws nothing further and the
+    // remainder flows to the elastic siblings instead of splitting evenly —
+    // otherwise a fixed override branch is handed supply it cannot consume
+    // while a maximize sibling starves.
+    const currentDemand = getEdgeDemand(edge, params.normalized, params.requiredPlan, params.actualPlan, params.gameData);
+    const elastic = currentDemand > floor + DEFAULT_EPSILON;
     const pull = cappedPull(
       edge,
       params.normalized,
@@ -498,7 +507,7 @@ function allocateRedistribute(params: {
       params.actualPlan,
       params.gameData,
       params.edgeRates,
-      { keepUnknownPullUnbounded: divergentFork, capByDemand: !divergentFork }
+      { keepUnknownPullUnbounded: divergentFork && elastic, capByDemand: !(divergentFork && elastic) }
     );
     return { edge, pull: Number.isFinite(pull) ? Math.max(0, pull - floor) : pull };
   });
