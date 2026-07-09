@@ -367,16 +367,53 @@ function isSupplySeededRecipe(node: ProductionNode): boolean {
 }
 
 /**
- * Tiered seeding matters when an active maximize node competes with a fixed
- * demand root for shared supply, and always when a spare-capacity node exists
- * (its chain must only ever receive leftover, reservations or not).
+ * A recipe with no override whose seeding pass will feed it "self-demand"
+ * (`selfDemandContribution`, below) because at least one of its outputs has
+ * no outgoing edge — i.e. an unsinked recipe. Such a node pulls as much of
+ * its available input supply as it can, exactly like an explicit
+ * `maximizeOutput` node, even though the flag was never set. Forks upstream
+ * of it must reserve fixed-demand siblings the same way they would for a
+ * true maximize node, or the reservation is skipped and the fixed sibling's
+ * share leaks into this node (the "unsinked recipe over-draws" bug).
  */
-function graphNeedsTieredSeeding(normalized: NormalizedGraph): boolean {
+function isSelfDemandSeededRecipe(
+  node: ProductionNode,
+  normalized: NormalizedGraph,
+  gameData: EngineGameData
+): boolean {
+  if (node.kind !== 'recipe' || node.machineCountOverride != null || node.productionRateOverride != null) {
+    return false;
+  }
+  const recipe = findRecipe(node.recipeId, gameData);
+  if (!recipe) return false;
+  const outgoing = normalized.outgoingEdgesByNode.get(node.id) ?? [];
+  return recipe.outputs.some((output) => {
+    if (!output.itemId) return false;
+    return !outgoing.some((edge) => itemsMatch(edge.itemId, output.itemId!));
+  });
+}
+
+function selfDemandSeededRecipeIds(normalized: NormalizedGraph, gameData: EngineGameData): Set<NodeId> {
+  const ids = new Set<NodeId>();
+  for (const node of normalized.nodes) {
+    if (isSelfDemandSeededRecipe(node, normalized, gameData)) ids.add(node.id);
+  }
+  return ids;
+}
+
+/**
+ * Tiered seeding matters when an active maximize node (or a self-demand-
+ * seeded unsinked recipe, which behaves the same way) competes with a fixed
+ * demand root for shared supply, and always when a spare-capacity node
+ * exists (its chain must only ever receive leftover, reservations or not).
+ */
+function graphNeedsTieredSeeding(
+  normalized: NormalizedGraph,
+  selfDemandSeededIds: ReadonlySet<NodeId>
+): boolean {
   if (normalized.nodes.some(isActiveSpareRecipe)) return true;
-  return (
-    normalized.nodes.some(isActiveMaximizeRecipe) &&
-    normalized.nodes.some(hasExplicitDemandRoot)
-  );
+  if (selfDemandSeededIds.size === 0 && !normalized.nodes.some(isActiveMaximizeRecipe)) return false;
+  return normalized.nodes.some(hasExplicitDemandRoot);
 }
 
 function addDemandSeed(seed: DemandSeed, nodeId: NodeId, itemId: string, rate: number): void {
@@ -1062,7 +1099,18 @@ function splitSupplyAcrossOutgoingEdges(
         tiering.activeSpareUpstream.has(edge.targetId)
     );
     if (hasMaximizeBranch || hasSpareBranch) {
-      const reserved = edges.map((edge) => getBranchDemandFromPlan(edge, tiering.fixedPlan, normalized));
+      // Only genuinely fixed branches (not maximize/spare) reserve their
+      // fixed-plan demand: maximize branches take the remainder and spare
+      // branches take the leftover, so both must reserve 0. Reserving a
+      // maximize branch's downstream fixed demand here would dilute a
+      // competing fixed tap in the scarce split below (it would grab supply
+      // proportional to a demand it is meant to absorb elastically, not claim).
+      const reserved = edges.map((edge) => {
+        const isMaximize = tiering.activeMaximizeUpstream.has(edge.targetId);
+        const isSpare = !isMaximize && tiering.activeSpareUpstream.has(edge.targetId);
+        if (isMaximize || isSpare) return 0;
+        return getBranchDemandFromPlan(edge, tiering.fixedPlan, normalized);
+      });
       const totalReserved = reserved.reduce((sum, value) => sum + value, 0);
       if (totalReserved > DEFAULT_EPSILON || hasSpareBranch) {
         return splitSupplyWithFixedReservation(
@@ -2038,8 +2086,11 @@ export function calculateRequiredPlan(
 
   // Reservation baseline for tiered supply seeding: the plan driven purely by
   // explicit roots, computed once so it stays constant across iterations.
+  const selfDemandSeededIds = skipSupplySeeding
+    ? new Set<NodeId>()
+    : selfDemandSeededRecipeIds(normalized, gameData);
   let tiering: SupplySeedTiering | undefined;
-  if (!skipSupplySeeding && graphNeedsTieredSeeding(normalized)) {
+  if (!skipSupplySeeding && graphNeedsTieredSeeding(normalized, selfDemandSeededIds)) {
     const fixed = calculateRequiredPlan(normalized, gameData, {
       epsilon,
       maxIterations,
@@ -2049,7 +2100,10 @@ export function calculateRequiredPlan(
     if (!fixed.diagnostics.some((diagnostic) => diagnostic.code === 'cycle')) {
       tiering = {
         fixedPlan: fixed.plan,
-        activeMaximizeUpstream: upstreamOfMaximizedSet(normalized, true),
+        activeMaximizeUpstream: new Set([
+          ...upstreamOfMaximizedSet(normalized, true),
+          ...upstreamOfNodesMatching(normalized, (node) => selfDemandSeededIds.has(node.id)),
+        ]),
         activeSpareUpstream: upstreamOfNodesMatching(normalized, isActiveSpareRecipe),
       };
     }
