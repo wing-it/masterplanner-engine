@@ -446,6 +446,12 @@ function sourceHasSharedOutputFork(normalized: NormalizedGraph, nodeId: NodeId):
 }
 
 function isDemandOnlySource(source: Extract<ProductionNode, { kind: 'source' }>): boolean {
+  // An unbounded source (elastic water pump, or the `manual-input` free-import
+  // placeholder) is always demand-following: it supplies whatever downstream
+  // pulls but never seeds production forward on its own. Without this, an
+  // unsinked/maximize recipe wired to an unconnected boundary input would size
+  // itself to consume the source's sentinel rate and blow up to ~1e9.
+  if (source.unbounded === true) return true;
   return (
     (source.sourceType === 'water' || source.sourceType === 'resource-claim') &&
     source.machineCountOverride == null

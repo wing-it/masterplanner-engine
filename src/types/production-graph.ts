@@ -51,10 +51,12 @@ export type ProductionNode =
       /**
        * Elastic/demand-sized source: never constrains or drives production,
        * always fully supplied, machine count back-computed from demand (e.g. a
-       * user-placed water pump with no fixed pump count). Purely descriptive —
-       * no solver algorithm keys off this flag; it lets display layers tell a
-       * real unbounded source apart from the implicit `manual-input`
-       * free-import placeholder, both of which share the sentinel rate.
+       * user-placed water pump with no fixed pump count, or the implicit
+       * `manual-input` free-import placeholder). The solver treats an unbounded
+       * source as demand-only (`isDemandOnlySource`), so it supplies whatever is
+       * pulled but never seeds an unsinked/maximize consumer up to its sentinel
+       * rate. Display layers also use it to tell such placeholders apart from a
+       * real bounded source that shares the sentinel rate.
        */
       unbounded?: boolean;
     }
