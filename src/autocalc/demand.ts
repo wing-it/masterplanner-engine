@@ -1173,9 +1173,11 @@ function recipeMachinesFromAvailableInputs(
   node: Extract<ProductionNode, { kind: 'recipe' }>,
   recipe: EngineRecipeDefinition,
   available: ReadonlyMap<string, number>,
-  gameData: EngineGameData
+  gameData: EngineGameData,
+  normalized: NormalizedGraph
 ): number {
   const opts = recipeRateOptions(node, recipe, gameData);
+  const incoming = normalized.incomingEdgesByNode.get(node.id) ?? [];
   let machines = Number.POSITIVE_INFINITY;
   let hasSuppliedInput = false;
 
@@ -1183,6 +1185,15 @@ function recipeMachinesFromAvailableInputs(
     if (!input.itemId) continue;
     const inputRate = ratePerMachine(recipe, input.itemId, false) * ((node.clockPercent ?? 100) / 100);
     if (inputRate <= 0) continue;
+
+    // An input backed anywhere by an elastic source is never limiting: the
+    // elastic feeder is trusted to make up any shortfall, so a small nonzero
+    // amount from a finite co-supplier (e.g. a cyclic byproduct sharing the
+    // same pool) must not cap machine sizing below what other inputs allow.
+    const matching = incoming.filter((edge) => itemsMatch(edge.itemId, input.itemId));
+    if (matching.length > 0 && matching.some((edge) => hasElasticBackstop(edge.sourceId, normalized))) {
+      continue;
+    }
 
     let suppliedRate = readAvailableInput(available, input.itemId);
     if (node.inputRateOverride && itemsMatch(node.inputRateOverride.itemId, input.itemId)) {
@@ -1283,6 +1294,51 @@ function hasUnseededDirectClaimInput(
   return false;
 }
 
+/**
+ * Whether a node feeding an unsuppliable input is an "exempt" feeder — a
+ * source that legitimately does not seed supply on its own (demand-only) or a
+ * recipe whose output will arrive once the graph settles. A `pool` node is
+ * transparent to this check: it is exempt if any of its own inflows is an
+ * exempt feeder, so the exemption still propagates when a second supplier
+ * (e.g. a cyclic byproduct) forces the builder to insert a pool between the
+ * exempt source and the consumer. Recursion is capped at one pool hop — a
+ * pool never feeds another pool — purely as a cycle guard.
+ */
+function isExemptFeeder(sourceId: NodeId, normalized: NormalizedGraph, depth = 0): boolean {
+  const source = normalized.nodesById.get(sourceId);
+  if (source?.kind === 'source' && isDemandOnlySource(source)) return true;
+  if (source?.kind === 'recipe') return true;
+  if (source?.kind === 'pool' && depth < 1) {
+    return (normalized.incomingEdgesByNode.get(sourceId) ?? []).some((edge) =>
+      isExemptFeeder(edge.sourceId, normalized, depth + 1)
+    );
+  }
+  return false;
+}
+
+/**
+ * Whether an input is backed, directly or through one pool hop, by a
+ * genuinely elastic (demand-only/unbounded) source such as an unmetered
+ * water pump. Narrower than `isExemptFeeder`: a plain recipe source does NOT
+ * count here, only a real elastic source does. Used to keep a small finite
+ * co-supplier sharing the same pool (e.g. a cyclic byproduct trickle) from
+ * being mistaken for the input's full available supply — an elastic backstop
+ * is trusted to cover any shortfall, so the input must never cap generator
+ * sizing at whatever partial amount the finite co-supplier happens to
+ * deliver on a given pass. Recursion is capped at one pool hop as a cycle
+ * guard, mirroring `isExemptFeeder`.
+ */
+function hasElasticBackstop(sourceId: NodeId, normalized: NormalizedGraph, depth = 0): boolean {
+  const source = normalized.nodesById.get(sourceId);
+  if (source?.kind === 'source' && isDemandOnlySource(source)) return true;
+  if (source?.kind === 'pool' && depth < 1) {
+    return (normalized.incomingEdgesByNode.get(sourceId) ?? []).some((edge) =>
+      hasElasticBackstop(edge.sourceId, normalized, depth + 1)
+    );
+  }
+  return false;
+}
+
 function hasUnsuppliedConnectedInput(
   node: Extract<ProductionNode, { kind: 'recipe' }>,
   recipe: EngineRecipeDefinition,
@@ -1307,10 +1363,7 @@ function hasUnsuppliedConnectedInput(
     if (suppliedRate <= DEFAULT_EPSILON) {
       const hasExemptSource = incoming.some((edge) => {
         if (!itemsMatch(edge.itemId, input.itemId)) return false;
-        const source = normalized.nodesById.get(edge.sourceId);
-        if (source?.kind === 'source' && isDemandOnlySource(source)) return true;
-        if (source?.kind === 'recipe') return true;
-        return false;
+        return isExemptFeeder(edge.sourceId, normalized);
       });
       if (!hasExemptSource) return true;
     }
@@ -1373,6 +1426,14 @@ function seedGeneratorInputDemand(
           }
         }
       }
+
+      // An input backed anywhere (directly or through one pool hop) by a
+      // genuinely elastic source never limits generator sizing: the elastic
+      // source is trusted to cover whatever a finite co-supplier (e.g. a
+      // small cyclic byproduct sharing the same pool) falls short of. Without
+      // this, a byproduct's small trickle would seed a tiny, wrong demand
+      // that caps the generator far below what its other inputs (fuel) allow.
+      if (incoming.some((edge) => hasElasticBackstop(edge.sourceId, normalized))) continue;
 
       const availableRate = readAvailableInput(nodeAvailable, input.itemId);
       const demandRate = sourceCap > 0 ? Math.min(availableRate, sourceCap) : availableRate;
@@ -1520,7 +1581,8 @@ function seedSupplyDrivenDemand(
               node,
               recipe,
               available,
-              gameData
+              gameData,
+              normalized
             );
         if (node.maximizeOutput || node.overproduceFromSurplus) {
           // Last processing wins: the queue re-enqueues the node whenever its
