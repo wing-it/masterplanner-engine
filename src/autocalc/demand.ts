@@ -1197,7 +1197,15 @@ function recipeMachinesFromAvailableInputs(
     // amount from a finite co-supplier (e.g. a cyclic byproduct sharing the
     // same pool) must not cap machine sizing below what other inputs allow.
     const matching = incoming.filter((edge) => itemsMatch(edge.itemId, input.itemId));
-    if (matching.length > 0 && matching.some((edge) => hasElasticBackstop(edge.sourceId, normalized))) {
+    if (
+      matching.length > 0 &&
+      matching.some(
+        (edge) =>
+          hasElasticBackstop(edge.sourceId, normalized) ||
+          hasByproductRemainderBackstop(edge.sourceId, normalized, gameData) ||
+          hasCyclicByproductBackstop(node.id, edge, normalized, gameData)
+      )
+    ) {
       continue;
     }
 
@@ -1345,6 +1353,92 @@ function hasElasticBackstop(sourceId: NodeId, normalized: NormalizedGraph, depth
   return false;
 }
 
+/**
+ * Whether an input is fed through a `pool` that mixes a fixed-byproduct
+ * inflow with at least one non-byproduct "remainder" supplier — a plain
+ * recipe (e.g. a dedicated converter) or a demand-only source. In that case
+ * the finite byproduct is only a *partial* contributor: the remainder
+ * supplier is demand-driven and will scale up to cover whatever the byproduct
+ * does not, so the byproduct's small trickle must never cap the consumer at
+ * whatever partial amount it happens to deliver on a pass. Inside a cycle
+ * (the byproduct feeds back from a downstream recipe) that false cap decays
+ * geometrically and collapses the whole chain to zero.
+ *
+ * Narrower than trusting any recipe co-supplier: the "byproduct present" gate
+ * keeps a plain multi-recipe pool (no byproduct inflow) still capping, because
+ * that pool is a genuine finite bottleneck. Recursion is capped at one pool
+ * hop as a cycle guard, mirroring `hasElasticBackstop` / `isExemptFeeder`.
+ * A pool is required (depth must reach 1): a direct byproduct edge with no
+ * pooled remainder co-supplier is a real bound and is left to cap normally.
+ */
+function hasByproductRemainderBackstop(
+  sourceId: NodeId,
+  normalized: NormalizedGraph,
+  gameData: EngineGameData,
+  depth = 0
+): boolean {
+  const source = normalized.nodesById.get(sourceId);
+  if (source?.kind !== 'pool' || depth >= 1) return false;
+
+  const inflows = normalized.incomingEdgesByNode.get(sourceId) ?? [];
+  let hasByproduct = false;
+  let hasRemainderSupplier = false;
+  for (const edge of inflows) {
+    if (isFixedByproductEdge(edge, normalized, gameData)) {
+      hasByproduct = true;
+      continue;
+    }
+    const inflowSource = normalized.nodesById.get(edge.sourceId);
+    if (
+      inflowSource?.kind === 'recipe' ||
+      (inflowSource?.kind === 'source' && isDemandOnlySource(inflowSource))
+    ) {
+      hasRemainderSupplier = true;
+    }
+  }
+  return hasByproduct && hasRemainderSupplier;
+}
+
+/**
+ * Whether a supplying edge is a fixed-byproduct edge whose producer lies on a
+ * cycle *back through the consumer* — i.e. the consumer feeds (directly or
+ * transitively) into the byproduct's producer, which recycles a byproduct back
+ * to the consumer. Such a recycle is self-satisfying (a 1:1 loop is stable at
+ * any throughput), so the byproduct must never act as a finite forward-seed
+ * cap: doing so lets the marginally-stable loop settle at a partial throughput
+ * and drags a downstream maximize/supply-bound node down with it.
+ *
+ * This covers the *sole, unpooled* byproduct-supplier case that the pool-based
+ * `hasElasticBackstop` / `hasByproductRemainderBackstop` deliberately skip.
+ * Requiring `isFixedByproductEdge` (a `recipe` source) scopes it to the direct
+ * edge; pooled variants stay handled by the two backstops above.
+ */
+function hasCyclicByproductBackstop(
+  consumerNodeId: NodeId,
+  edge: ProductionEdge,
+  normalized: NormalizedGraph,
+  gameData: EngineGameData
+): boolean {
+  if (!isFixedByproductEdge(edge, normalized, gameData)) return false;
+
+  // Downstream reachability: is the byproduct's producer reachable from the
+  // consumer by following outgoing edges? If so the consumer feeds it, closing
+  // the recycle loop.
+  const producerId = edge.sourceId;
+  const visited = new Set<NodeId>([consumerNodeId]);
+  const queue: NodeId[] = [consumerNodeId];
+  while (queue.length > 0) {
+    const nodeId = queue.shift()!;
+    for (const outgoing of normalized.outgoingEdgesByNode.get(nodeId) ?? []) {
+      if (outgoing.targetId === producerId) return true;
+      if (visited.has(outgoing.targetId)) continue;
+      visited.add(outgoing.targetId);
+      queue.push(outgoing.targetId);
+    }
+  }
+  return false;
+}
+
 function hasUnsuppliedConnectedInput(
   node: Extract<ProductionNode, { kind: 'recipe' }>,
   recipe: EngineRecipeDefinition,
@@ -1439,7 +1533,16 @@ function seedGeneratorInputDemand(
       // small cyclic byproduct sharing the same pool) falls short of. Without
       // this, a byproduct's small trickle would seed a tiny, wrong demand
       // that caps the generator far below what its other inputs (fuel) allow.
-      if (incoming.some((edge) => hasElasticBackstop(edge.sourceId, normalized))) continue;
+      if (
+        incoming.some(
+          (edge) =>
+            hasElasticBackstop(edge.sourceId, normalized) ||
+            hasByproductRemainderBackstop(edge.sourceId, normalized, gameData) ||
+            hasCyclicByproductBackstop(node.id, edge, normalized, gameData)
+        )
+      ) {
+        continue;
+      }
 
       const availableRate = readAvailableInput(nodeAvailable, input.itemId);
       const demandRate = sourceCap > 0 ? Math.min(availableRate, sourceCap) : availableRate;
