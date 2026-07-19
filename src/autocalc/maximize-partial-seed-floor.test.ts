@@ -39,19 +39,19 @@ function graph(overrides: Partial<ProductionGraph> & Pick<ProductionGraph, 'node
 }
 
 /**
- * Owner-reported bug (uranium cell factory): a maximized recipe with one
- * bounded-but-unseedable input (demand-mode resource claim, builder sentinel
- * maxRatePerMin=1e9) and one seedable input chain was floor-sized from the
- * seedable chain alone. Adding a small override consumer took a 150/min
- * factory to ~5000/min, because the acid chain's seeded capacity — not
- * demand — set the machine count, and the claim's sentinel capacity meant
- * constraint scaling could never pull it back.
+ * Owner-approved semantics reversal (2026-07-12): a maximize recipe with one
+ * demand-mode resource claim (builder sentinel maxRatePerMin=1e9, no count) and
+ * one seedable input chain scales to the SEEDED chain. The demand-mode claim is
+ * an elastic follower — it supplies whatever the bounded acid chain allows —
+ * exactly like the elastic-water case below. This deliberately reverses the
+ * earlier F6/F8 "demand-mode claim keeps the node demand-driven" guard: the UX
+ * concern it addressed (a factory jumping when a small consumer connects) is now
+ * handled by the Finalize/lock feature. See maximize-elastic-claim-follower.test.ts.
  *
- * Expected: the supply-seeded floor only applies when every connected input
- * actually seeded (inputs fed purely by elastic water sources are exempt);
- * otherwise the node stays demand-driven.
+ * The elastic-water floor case (third test) is unchanged: it already floored to
+ * the seeded input, which is now the uniform behavior for all elastic inputs.
  */
-describe('maximizeOutput floor with partially seedable inputs', () => {
+describe('maximizeOutput floor with an elastic (demand-mode / water) input', () => {
   function cellsData() {
     return gameData([
       recipe({
@@ -101,17 +101,22 @@ describe('maximizeOutput floor with partially seedable inputs', () => {
     return graph({ nodes, edges });
   }
 
-  it('keeps a maximized recipe demand-driven when a bounded input cannot seed', () => {
+  it('scales a maximized recipe to the seeded acid supply, the demand-mode claim following', () => {
     const { result } = solveProductionGraph(cellsGraph({ withNobelisk: false }), cellsData());
 
-    expect(result.nodes.cells?.outputs).toContainEqual({ itemId: 'cell', ratePerMin: 150 });
+    // Sulfur 3000 -> acid 3000 -> uranium-cell (15 acid/machine) = 200 machines
+    // -> 5000 cell. Uranium (demand-mode claim) elastically supplies the 10000
+    // it needs. The 150 power-plant sink is one consumer of the pinned output.
+    expect(result.nodes.cells?.outputs).toContainEqual({ itemId: 'cell', ratePerMin: 5000 });
+    expect(result.edges['cells-to-plant']?.allocation).toBeCloseTo(150, 4);
   });
 
-  it('adding a small override consumer grows output by exactly its demand', () => {
+  it('a new fixed tap divides the pinned output instead of inflating it', () => {
     const { result } = solveProductionGraph(cellsGraph({ withNobelisk: true }), cellsData());
 
-    // 150 export (maximize keeps the advertised port rate) + 10 for the nobelisk.
-    expect(result.nodes.cells?.outputs).toContainEqual({ itemId: 'cell', ratePerMin: 160 });
+    // Output stays pinned at the acid-seeded bound; the nobelisk's 10 and the
+    // power-plant's 150 are both drawn from it, not added on top.
+    expect(result.nodes.cells?.outputs).toContainEqual({ itemId: 'cell', ratePerMin: 5000 });
     expect(result.edges['cells-to-plant']?.allocation).toBeCloseTo(150, 4);
     expect(result.edges['cells-to-nobelisk']?.allocation).toBeCloseTo(10, 4);
   });

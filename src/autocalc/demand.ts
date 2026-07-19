@@ -1229,8 +1229,11 @@ function recipeMachinesFromAvailableInputs(
  * A supply-seeded size computed while such an input exists is an upper guess
  * from the other inputs only — not a trustworthy floor — so the node keeps its
  * demand-driven size (no floor, no scale-down immunity). Inputs fed purely by
- * elastic water sources are exempt: water sizes to whatever is asked, so it
- * never bounds the node and cannot invalidate a floor from the other inputs.
+ * elastic demand-only sources are exempt: an unmetered water pump, an unbounded
+ * manual import, or a demand-mode resource claim (claimed but count-unset) all
+ * size to whatever is asked, so they never bound the node and cannot invalidate
+ * a floor from the other, bounded inputs. Only a recipe/pool-fed input that is
+ * genuinely unseeded still counts here (its real supply may bind lower).
  */
 function hasUnseededConnectedInput(
   node: Extract<ProductionNode, { kind: 'recipe' }>,
@@ -1252,57 +1255,11 @@ function hasUnseededConnectedInput(
     }
     if (suppliedRate > DEFAULT_EPSILON) continue;
 
-    const allElasticWater = matching.every((edge) => {
+    const allElastic = matching.every((edge) => {
       const source = normalized.nodesById.get(edge.sourceId);
-      return source?.kind === 'source' && source.sourceType === 'water' && isDemandOnlySource(source);
+      return source?.kind === 'source' && isDemandOnlySource(source);
     });
-    if (!allElasticWater) return true;
-  }
-
-  return false;
-}
-
-/**
- * A stronger condition than `hasUnseededConnectedInput`: an unseeded connected
- * input fed *directly* by a demand-mode resource claim (a raw resource that
- * reports a sentinel "unbounded" capacity and cannot seed). This is the case
- * where the supply-seeded size is not just an upper guess but actively wrong —
- * the claim is the intended bottleneck yet the seed sizes from the *other*
- * inputs, unbounded. Such a node must fall back to demand-driven sizing.
- *
- * An input fed by a recipe/pool chain is NOT this case: it is either transient
- * (will propagate) or a real intermediate whose own supply the constraint pass
- * can scale against — so its node keeps the seed as a pin-ceiling.
- */
-function hasUnseededDirectClaimInput(
-  node: Extract<ProductionNode, { kind: 'recipe' }>,
-  recipe: EngineRecipeDefinition,
-  available: ReadonlyMap<string, number>,
-  normalized: NormalizedGraph
-): boolean {
-  const incoming = normalized.incomingEdgesByNode.get(node.id) ?? [];
-
-  for (const input of recipe.inputs) {
-    if (!input.itemId) continue;
-    if (ratePerMachine(recipe, input.itemId, false) <= DEFAULT_EPSILON) continue;
-    const matching = incoming.filter((edge) => itemsMatch(edge.itemId, input.itemId));
-    if (matching.length === 0) continue;
-
-    let suppliedRate = readAvailableInput(available, input.itemId);
-    if (node.inputRateOverride && itemsMatch(node.inputRateOverride.itemId, input.itemId)) {
-      suppliedRate += node.inputRateOverride.ratePerMin;
-    }
-    if (suppliedRate > DEFAULT_EPSILON) continue;
-
-    const hasDemandModeClaim = matching.some((edge) => {
-      const source = normalized.nodesById.get(edge.sourceId);
-      return (
-        source?.kind === 'source' &&
-        source.sourceType === 'resource-claim' &&
-        isDemandOnlySource(source)
-      );
-    });
-    if (hasDemandModeClaim) return true;
+    if (!allElastic) return true;
   }
 
   return false;
@@ -1706,17 +1663,17 @@ function seedSupplyDrivenDemand(
             unseededInputNodeIds.delete(node.id);
           }
 
-          if (hasUnseededDirectClaimInput(node, recipe, available, normalized)) {
-            // Seed sized from the wrong inputs (a demand-mode raw claim, the
-            // intended bottleneck, could not seed): discard it so the node
-            // stays demand-driven rather than pinning to an inflated size.
-            supplyMachinesByNode.delete(node.id);
-          } else {
-            // Seed is a real ceiling (all bottlenecks are seeded intermediates
-            // or bounded sources): keep it so the node pins to it and a large
-            // downstream demand cannot inflate it past deliverable supply.
-            supplyMachinesByNode.set(node.id, machines);
-          }
+          // Keep the supply-seeded size as the node's ceiling. A demand-mode
+          // resource claim (claimed but count-unset) is an ELASTIC FOLLOWER,
+          // like an unmetered water pump: it supplies whatever the bounded
+          // inputs allow, so the recipe scales to those bounded inputs rather
+          // than collapsing to zero-demand. When NO input can seed, `machines`
+          // is already 0 (see recipeMachinesFromAvailableInputs), so the node
+          // still stays at zero — the blowup guard is preserved for that case.
+          // (Owner-approved reversal 2026-07-12 of the F6/F8 demand-mode-claim
+          // discard; the "jumps when a consumer connects" UX concern is now
+          // handled by the Finalize/lock feature instead.)
+          supplyMachinesByNode.set(node.id, machines);
         }
         outputs = toRecord(ratesForMachines(recipe, machines, recipeRateOptions(node, recipe, gameData)).outputs);
       }
