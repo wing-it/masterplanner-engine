@@ -76,7 +76,7 @@ describe('unbounded manual-input never seeds production forward', () => {
     // output rows emitted), exactly as it read before the input was minted.
     const pelletRate = result.nodes.pellets?.outputs.find((o) => o.itemId === 'pellet')?.ratePerMin ?? 0;
     expect(pelletRate).toBeCloseTo(0, 6);
-    expect(result.nodes.pellets?.requiredMachines ?? 0).toBeCloseTo(0, 6);
+    expect(result.nodes.pellets?.machines ?? 0).toBeCloseTo(0, 6);
   });
 
   it('still supplies an unbounded manual import when a real downstream sink pulls it', () => {
