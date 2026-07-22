@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { normalizeGraph } from '../graph/normalize';
 import type { EngineBuildingPowerProfile, EngineGameData, EngineRecipeDefinition } from '../types/game-data';
 import type { ProductionGraph } from '../types/production-graph';
-import { calculateRequiredPlan } from './demand';
+import { calculateRequiredPlan, type RequiredPlan } from './demand';
 
 function recipe(opts: {
   id: string;
@@ -949,6 +949,168 @@ describe('calculateRequiredPlan', () => {
     expect(result.plan.direct?.requiredInputs.coal).toBeCloseTo(450, 5);
     expect(result.plan.direct?.requiredMachines).toBeCloseTo(30, 5);
     expect(result.plan.coal?.requiredOutputs.coal).toBeCloseTo(1200, 5);
+  });
+
+  it('ranks a divergent fork by authored endpoint alias when the priority names no engine id', () => {
+    // Same fork as above, but the priority names the AUTHORED boundary port the
+    // app ranked; the engine edge's target was rewritten by flattening.
+    const data = gameData([
+      recipe({
+        id: 'coal-generator',
+        durationSeconds: 4,
+        inputs: [{ itemId: 'coal', amount: 1 }],
+        outputs: [],
+        product: null,
+      }),
+      recipe({
+        id: 'compacted-coal',
+        durationSeconds: 4,
+        inputs: [
+          { itemId: 'coal', amount: 1 },
+          { itemId: 'sulfur', amount: 1 },
+        ],
+        outputs: [{ itemId: 'compacted-coal', amount: 1 }],
+      }),
+    ]);
+    const routing = { portSide: 'output' as const, portId: 'out', priority: ['compacted-port'] };
+    const g = graph({
+      nodes: [
+        { kind: 'source', id: 'coal', itemId: 'coal', sourceType: 'manual-input', maxRatePerMin: 1200 },
+        { kind: 'source', id: 'sulfur', itemId: 'sulfur', sourceType: 'manual-input', maxRatePerMin: 750 },
+        { kind: 'recipe', id: 'direct', recipeId: 'coal-generator' },
+        { kind: 'recipe', id: 'compacted', recipeId: 'compacted-coal' },
+      ],
+      edges: [
+        { id: 'coal-direct', sourceId: 'coal', targetId: 'direct', itemId: 'coal', routing },
+        {
+          id: 'coal-compacted',
+          sourceId: 'coal',
+          targetId: 'compacted',
+          itemId: 'coal',
+          authoredTargetId: 'compacted-port',
+          routing,
+        },
+        { id: 'sulfur-compacted', sourceId: 'sulfur', targetId: 'compacted', itemId: 'sulfur' },
+      ],
+    });
+
+    const result = calculateRequiredPlan(normalizeGraph(g), data);
+
+    expect(result.plan.compacted?.requiredInputs.coal).toBeCloseTo(750, 5);
+    expect(result.plan.direct?.requiredInputs.coal).toBeCloseTo(450, 5);
+  });
+
+  it('lets a ranked seeded branch outgrow a dedicated elastic co-supplier frozen at its previous rate', () => {
+    // The nitric-acid demo shape: the ranked branch feeds a generator chain
+    // (sized from supply, so its plan follows this very split) and its second
+    // input comes from an elastic recipe whose ONLY consumer is that branch.
+    // The co-supplier's previous planned rate is an echo of the last split —
+    // treating it as a physical ceiling freezes the fork no matter how the
+    // user ranks it (nitric-acid priority bug, 2026-07-22).
+    const data = gameData([
+      recipe({
+        id: 'converter',
+        durationSeconds: 4,
+        inputs: [
+          { itemId: 'acid', amount: 1 },
+          { itemId: 'sulf', amount: 1 },
+        ],
+        outputs: [{ itemId: 'fuel', amount: 1 }],
+      }),
+      recipe({ id: 'sulf-maker', durationSeconds: 4, inputs: [], outputs: [{ itemId: 'sulf', amount: 1 }] }),
+      recipe({ id: 'burner', durationSeconds: 4, inputs: [{ itemId: 'fuel', amount: 1 }], outputs: [], product: null }),
+      recipe({ id: 'packager', durationSeconds: 4, inputs: [{ itemId: 'acid', amount: 1 }], outputs: [{ itemId: 'packaged', amount: 1 }] }),
+    ]);
+    const makeGraph = (priority: string[]): ProductionGraph => {
+      const routing = priority.length > 0
+        ? { portSide: 'output' as const, portId: 'out', priority }
+        : undefined;
+      return graph({
+        nodes: [
+          { kind: 'source', id: 'acid', itemId: 'acid', sourceType: 'manual-input', maxRatePerMin: 525 },
+          { kind: 'recipe', id: 'converter', recipeId: 'converter' },
+          { kind: 'recipe', id: 'sulf-maker', recipeId: 'sulf-maker' },
+          { kind: 'recipe', id: 'burner', recipeId: 'burner' },
+          { kind: 'recipe', id: 'packager', recipeId: 'packager' },
+        ],
+        edges: [
+          { id: 'acid-converter', sourceId: 'acid', targetId: 'converter', itemId: 'acid', ...(routing ? { routing } : {}) },
+          { id: 'acid-packager', sourceId: 'acid', targetId: 'packager', itemId: 'acid', ...(routing ? { routing } : {}) },
+          { id: 'sulf-feed', sourceId: 'sulf-maker', targetId: 'converter', itemId: 'sulf' },
+          { id: 'fuel-burner', sourceId: 'converter', targetId: 'burner', itemId: 'fuel' },
+        ],
+      });
+    };
+
+    // The even solve settles with the converter holding only a share of the
+    // acid, so the sulf supplier's planned output sits well below 525.
+    const base = calculateRequiredPlan(normalizeGraph(makeGraph([])), data);
+    const baseConverterAcid = base.plan.converter?.requiredInputs.acid ?? 0;
+    expect(baseConverterAcid).toBeLessThan(400);
+
+    // Ranking the converter must let it take the whole bounded supply — the
+    // stale sulf plan is not a physical limit, the supplier grows with it.
+    const prioritized = calculateRequiredPlan(
+      normalizeGraph(makeGraph(['converter'])),
+      data,
+      { previous: base.plan, dirtyNodeIds: ['acid'] }
+    );
+
+    expect(prioritized.plan.converter?.requiredInputs.acid).toBeCloseTo(525, 5);
+    expect(prioritized.plan['sulf-maker']?.requiredOutputs.sulf).toBeCloseTo(525, 5);
+  });
+
+  it('caps a ranked branch at its co-input bound and gives the whole remainder to the unranked absorber', () => {
+    // The nitric-acid packager shape: the ranked branch's chain is bounded by
+    // a co-input (waste), so it must take exactly what it can burn (463.5) and
+    // the unranked terminal absorber must receive the ENTIRE remainder (61.5)
+    // and size to it — not balloon to its other input, not freeze at a stale
+    // echo of its previous share.
+    const data = gameData([
+      recipe({
+        id: 'converter',
+        durationSeconds: 4,
+        inputs: [
+          { itemId: 'acid', amount: 1 },
+          { itemId: 'waste', amount: 2.5 },
+        ],
+        outputs: [{ itemId: 'fuel', amount: 1 }],
+      }),
+      recipe({ id: 'burner', durationSeconds: 4, inputs: [{ itemId: 'fuel', amount: 1 }], outputs: [], product: null }),
+      recipe({ id: 'packager', durationSeconds: 4, inputs: [{ itemId: 'acid', amount: 1 }], outputs: [{ itemId: 'packaged', amount: 1 }] }),
+    ]);
+    const routing = { portSide: 'output' as const, portId: 'out', priority: ['converter'] };
+    const g = graph({
+      nodes: [
+        { kind: 'source', id: 'acid', itemId: 'acid', sourceType: 'manual-input', maxRatePerMin: 525 },
+        { kind: 'source', id: 'waste', itemId: 'waste', sourceType: 'manual-input', maxRatePerMin: 1158.75 },
+        { kind: 'recipe', id: 'converter', recipeId: 'converter' },
+        { kind: 'recipe', id: 'burner', recipeId: 'burner' },
+        { kind: 'recipe', id: 'packager', recipeId: 'packager' },
+      ],
+      edges: [
+        { id: 'acid-converter', sourceId: 'acid', targetId: 'converter', itemId: 'acid', routing },
+        { id: 'acid-packager', sourceId: 'acid', targetId: 'packager', itemId: 'acid', routing },
+        { id: 'waste-converter', sourceId: 'waste', targetId: 'converter', itemId: 'waste' },
+        { id: 'fuel-burner', sourceId: 'converter', targetId: 'burner', itemId: 'fuel' },
+      ],
+    });
+
+    // Fresh solve, and a re-solve from a stale previous plan where the
+    // packager's share was a tiny echo — both must land on the same split.
+    const fresh = calculateRequiredPlan(normalizeGraph(g), data);
+    expect(fresh.plan.converter?.requiredInputs.acid).toBeCloseTo(463.5, 5);
+    expect(fresh.plan.packager?.requiredInputs.acid).toBeCloseTo(61.5, 5);
+
+    const again = calculateRequiredPlan(normalizeGraph(g), data, {
+      previous: {
+        ...fresh.plan,
+        packager: { nodeId: 'packager', requiredMachines: 1, requiredInputs: { acid: 15 }, requiredOutputs: { packaged: 15 } },
+      },
+      dirtyNodeIds: ['acid'],
+    });
+    expect(again.plan.converter?.requiredInputs.acid).toBeCloseTo(463.5, 5);
+    expect(again.plan.packager?.requiredInputs.acid).toBeCloseTo(61.5, 5);
   });
 
   it('fills compacted coal to a 720 sulfur physical limit when prioritized after an even split', () => {

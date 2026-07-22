@@ -11,6 +11,7 @@ import {
 } from '../graph/recipe-math';
 import { forkBranchesLeadToDifferentSinks } from './allocation';
 import { autoRankContestedFork } from './auto-priority';
+import { edgeIdentifiers, matchesIdentifier } from './edge-identity';
 import {
   classifyIncomingEdges,
   fixedRecipeOutputRates,
@@ -756,6 +757,33 @@ function getConnectedInputSupplyCeiling(
     // re-solves.
     if (isActiveMaximizeRecipe(source) || isActiveSpareRecipe(source)) return null;
 
+    // The same self-reinforcement applies to a dedicated elastic supplier:
+    // when everything it ships (for this item) flows into the very consumer
+    // being sized, its planned rate was derived FROM that consumer's previous
+    // size and carries no independent bound. Treating it as known freezes a
+    // fork at the last iteration's split — a ranked branch could then never
+    // grow to its real demand (nitric-acid priority bug, 2026-07-22). Its
+    // true bound, if any, lives upstream and surfaces as a shortage instead.
+    //
+    // Only DEMAND-FOLLOWING shipments echo like this. A generator's waste and
+    // any byproduct rate follow the supplier's OWN sizing (fuel chain, primary
+    // product), not this consumer's demand — those planned rates are genuine
+    // independent bounds and must keep capping (nulling the waste bound let a
+    // ranked acid branch absorb supply its consumer could never burn, starving
+    // the sibling's seed — same bug's second act, 2026-07-22).
+    const primaryItemId = recipe ? primaryOutputItemId(recipe) : null;
+    const followsConsumerDemand =
+      recipe != null &&
+      !isGeneratorRecipe(recipe, gameData) &&
+      (primaryItemId == null || itemsMatch(primaryItemId, edge.itemId));
+    if (followsConsumerDemand) {
+      const sameItemOutgoing = (normalized.outgoingEdgesByNode.get(source.id) ?? [])
+        .filter((other) => itemsMatch(other.itemId, edge.itemId));
+      if (sameItemOutgoing.length > 0 && sameItemOutgoing.every((other) => other.targetId === edge.targetId)) {
+        return null;
+      }
+    }
+
     const plannedRate = getRecordValue(previousPlan[source.id]?.requiredOutputs ?? {}, edge.itemId);
     if (plannedRate > DEFAULT_EPSILON) return plannedRate;
   }
@@ -767,7 +795,8 @@ function physicalBranchPullCeiling(
   edge: ProductionEdge,
   normalized: NormalizedGraph,
   gameData: EngineGameData,
-  previousPlan: RequiredPlan
+  previousPlan: RequiredPlan,
+  supplyMachinesByNode?: ReadonlyMap<NodeId, number>
 ): number {
   const target = normalized.nodesById.get(edge.targetId);
   if (target?.kind !== 'recipe') return Number.POSITIVE_INFINITY;
@@ -812,9 +841,24 @@ function physicalBranchPullCeiling(
     let supply = 0;
     let hasKnownSupply = false;
     for (const connectedEdge of connected) {
-      const ceiling = getConnectedInputSupplyCeiling(connectedEdge, normalized, gameData, previousPlan);
+      const ceiling = getConnectedInputSupplyCeiling(connectedEdge, normalized, gameData, previousPlan, supplyMachinesByNode);
       if (ceiling == null) continue;
-      supply += ceiling;
+      // The supplier's output may be shared: net off what its OTHER consumers
+      // already draw per the previous plan (mirrors elasticEdgeCapacity on
+      // the allocation side). Counting the full output here inflated a ranked
+      // branch's pull past what its co-inputs can really deliver — nuclear
+      // waste shared between non-fissile uranium and plutonium pellets read
+      // as 1968.75 instead of 1158.75, so the ranked acid branch absorbed
+      // supply the chain could never burn (2026-07-22).
+      const committedElsewhere = (normalized.outgoingEdgesByNode.get(connectedEdge.sourceId) ?? [])
+        .filter(
+          (other) =>
+            other.id !== connectedEdge.id &&
+            itemsMatch(other.itemId, connectedEdge.itemId) &&
+            other.targetId !== connectedEdge.targetId
+        )
+        .reduce((sum, other) => sum + getBranchDemandFromPlan(other, previousPlan, normalized), 0);
+      supply += Math.max(0, ceiling - committedElsewhere);
       hasKnownSupply = true;
     }
 
@@ -856,7 +900,8 @@ function splitSupplyDivergentPriority(
   supplyRate: number,
   previousPlan: RequiredPlan,
   normalized: NormalizedGraph,
-  gameData: EngineGameData
+  gameData: EngineGameData,
+  supplyMachinesByNode?: ReadonlyMap<NodeId, number>
 ): Map<string, number> {
   const ranked = edges
     .map((edge) => ({ edge, rank: rankForEdge(edge, edges) }))
@@ -864,7 +909,7 @@ function splitSupplyDivergentPriority(
     .sort((left, right) => left.rank - right.rank || left.edge.id.localeCompare(right.edge.id))
     .map((entry) => entry.edge);
 
-  return splitSupplyPriorityOrdered(ranked, edges, supplyRate, previousPlan, normalized, gameData);
+  return splitSupplyPriorityOrdered(ranked, edges, supplyRate, previousPlan, normalized, gameData, supplyMachinesByNode);
 }
 
 function splitSupplyPriorityOrdered(
@@ -873,13 +918,14 @@ function splitSupplyPriorityOrdered(
   supplyRate: number,
   previousPlan: RequiredPlan,
   normalized: NormalizedGraph,
-  gameData: EngineGameData
+  gameData: EngineGameData,
+  supplyMachinesByNode?: ReadonlyMap<NodeId, number>
 ): Map<string, number> {
   const allocations = new Map<string, number>();
   let remaining = Math.max(0, supplyRate);
 
   for (const edge of orderedEdges) {
-    const physicalPull = physicalBranchPullCeiling(edge, normalized, gameData, previousPlan);
+    const physicalPull = physicalBranchPullCeiling(edge, normalized, gameData, previousPlan, supplyMachinesByNode);
     const pull = Number.isFinite(physicalPull)
       ? physicalPull
       : remaining;
@@ -891,8 +937,23 @@ function splitSupplyPriorityOrdered(
   const unranked = allEdges.filter((edge) => !allocations.has(edge.id));
   if (unranked.length > 0 && remaining > DEFAULT_EPSILON) {
     const remainder = splitSupplySaturationRedistribute(unranked, remaining, normalized, gameData, previousPlan);
+    let distributed = 0;
     for (const edge of unranked) {
-      allocations.set(edge.id, remainder.get(edge.id) ?? 0);
+      const share = remainder.get(edge.id) ?? 0;
+      allocations.set(edge.id, share);
+      distributed += share;
+    }
+    // The ranked branches deliberately left this remainder for the unranked
+    // pool — it must all land there. The saturation split water-fills by each
+    // branch's planned demand, which for an elastic absorber is just an echo
+    // of its previous share; dropping the unplaced leftover would freeze the
+    // absorber at that echo instead of letting it soak up the remainder.
+    const leftover = remaining - distributed;
+    if (leftover > DEFAULT_EPSILON) {
+      const perEdge = leftover / unranked.length;
+      for (const edge of unranked) {
+        allocations.set(edge.id, (allocations.get(edge.id) ?? 0) + perEdge);
+      }
     }
   }
 
@@ -1057,7 +1118,8 @@ function splitSupplyAcrossOutgoingEdges(
   normalized: NormalizedGraph,
   gameData: EngineGameData,
   tiering?: SupplySeedTiering,
-  autoPrioritizeContestedForks?: boolean
+  autoPrioritizeContestedForks?: boolean,
+  supplyMachinesByNode?: ReadonlyMap<NodeId, number>
 ): Map<string, number> {
   if (edges.length === 0) return new Map();
   if (edges.length === 1) return new Map([[edges[0]!.id, supplyRate]]);
@@ -1088,10 +1150,13 @@ function splitSupplyAcrossOutgoingEdges(
 
   const hasRouting = edges.some((edge) => rankForEdge(edge, edges) != null);
   if (hasRouting) {
-    if (forkBranchesLeadToDifferentSinks(edges, normalized, new Map())) {
-      return splitSupplyDivergentPriority(edges, supplyRate, previousPlan, normalized, gameData);
-    }
-    return splitDemandAcrossEdges(edges, supplyRate, previousPlan);
+    // Ranked fan-out always serves branches up to their PULL in order, with
+    // the remainder flowing to unranked branches. splitDemandAcrossEdges'
+    // ranked loop caps by the SOURCE's own planned output — fan-in semantics
+    // (a ranked supplier gives what it makes) that, applied here, let the
+    // first ranked branch swallow the entire output and starve every sibling
+    // seed (the packager-ballooning half of the nitric-acid bug, 2026-07-22).
+    return splitSupplyDivergentPriority(edges, supplyRate, previousPlan, normalized, gameData, supplyMachinesByNode);
   }
 
   // Fixed demand (overrides, explicit sinks) reserves fork supply before
@@ -1550,9 +1615,15 @@ function seedSupplyDrivenDemand(
   previousPlan: RequiredPlan,
   dirtySet?: Set<NodeId>,
   tiering?: SupplySeedTiering,
-  autoPrioritizeContestedForks?: boolean
+  autoPrioritizeContestedForks?: boolean,
+  initialSupplyMachines?: ReadonlyMap<NodeId, number>
 ): SupplySeedResult {
-  const supplyMachinesByNode = new Map<NodeId, number>();
+  // Carry the previous iteration's seeds as the starting view: the walk's
+  // fork splits read seeded co-input capacities (via physicalBranchPullCeiling)
+  // and queue order does not guarantee a supplier seeds before a fork that
+  // needs its capacity. Flags cannot change within a solve, so entries are
+  // only ever refreshed, never wrongly retained.
+  const supplyMachinesByNode = new Map<NodeId, number>(initialSupplyMachines ?? []);
   const unseededInputNodeIds = new Set<NodeId>();
   // Sources feeding either supply-seeded flavor (maximize or spare) must seed.
   const upstreamOfMaximized = upstreamOfNodesMatching(normalized, isSupplySeededRecipe);
@@ -1710,7 +1781,8 @@ function seedSupplyDrivenDemand(
         normalized,
         gameData,
         tiering,
-        autoPrioritizeContestedForks
+        autoPrioritizeContestedForks,
+        supplyMachinesByNode
       );
       for (const edge of outgoing) {
         const splitRate = allocations.get(edge.id) ?? 0;
@@ -1738,16 +1810,14 @@ function rankForEdge(edge: ProductionEdge, relevantEdges: readonly ProductionEdg
   const priority = edge.routing?.priority ?? [];
   if (priority.length === 0) return null;
 
-  const identifiers = [edge.id, edge.sourceId, edge.targetId];
+  const identifiers = edgeIdentifiers(edge);
   for (const identifier of identifiers) {
     const rank = priority.indexOf(identifier);
     if (rank >= 0) return rank;
   }
 
   for (const peerId of priority) {
-    const peerIndex = relevantEdges.findIndex((candidate) =>
-      candidate.id === peerId || candidate.sourceId === peerId || candidate.targetId === peerId
-    );
+    const peerIndex = relevantEdges.findIndex((candidate) => matchesIdentifier(candidate, peerId));
     if (peerIndex >= 0 && relevantEdges[peerIndex]?.id === edge.id) return priority.indexOf(peerId);
   }
 
@@ -1936,7 +2006,8 @@ function seedDemandRoots(
   dirtySet?: Set<NodeId>,
   skipSupplySeeding?: boolean,
   tiering?: SupplySeedTiering,
-  autoPrioritizeContestedForks?: boolean
+  autoPrioritizeContestedForks?: boolean,
+  initialSupplyMachines?: ReadonlyMap<NodeId, number>
 ): SupplySeedResult {
   for (const node of normalized.nodes) {
     if (node.kind === 'sink') {
@@ -1982,7 +2053,8 @@ function seedDemandRoots(
     previousPlan,
     dirtySet,
     tiering,
-    autoPrioritizeContestedForks
+    autoPrioritizeContestedForks,
+    initialSupplyMachines
   );
 }
 
@@ -2061,6 +2133,7 @@ function runDemandIteration(
     skipSupplySeeding?: boolean;
     tiering?: SupplySeedTiering;
     autoPrioritizeContestedForks?: boolean;
+    initialSupplyMachines?: ReadonlyMap<NodeId, number>;
   }
 ): {
   plan: RequiredPlan;
@@ -2089,7 +2162,8 @@ function runDemandIteration(
     dirtySet,
     seedOptions?.skipSupplySeeding,
     seedOptions?.tiering,
-    seedOptions?.autoPrioritizeContestedForks
+    seedOptions?.autoPrioritizeContestedForks,
+    seedOptions?.initialSupplyMachines
   );
 
   for (const nodeId of backwardOrder(normalized)) {
@@ -2236,13 +2310,13 @@ export function calculateRequiredPlan(
       };
     }
   }
-  const seedOptions = {
-    skipSupplySeeding,
-    tiering,
-    autoPrioritizeContestedForks: options.autoPrioritizeContestedForks,
-  };
-
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const seedOptions = {
+      skipSupplySeeding,
+      tiering,
+      autoPrioritizeContestedForks: options.autoPrioritizeContestedForks,
+      initialSupplyMachines: iteration > 0 ? supplyMachinesByNode : undefined,
+    };
     const result = runDemandIteration(normalized, gameData, prevIterPlan, demandSeed, dirtySet, epsilon, seedOptions);
     currentPlan = result.plan;
     diagnostics.push(...result.diagnostics);

@@ -157,6 +157,28 @@ describe('validateProductionGraph', () => {
     expect(result.warnings).toContainEqual(expect.objectContaining({ code: 'deprecated-schema' }));
   });
 
+  it('preserves authored endpoint aliases through validation', () => {
+    // Zod strips unknown keys, and the pipeline solves the PARSED graph — if
+    // these fall out here, junction priority silently stops ranking flattened
+    // boundary consumers.
+    const result = validateProductionGraph({
+      ...validGraph,
+      edges: [
+        {
+          ...validGraph.edges[0]!,
+          authoredSourceId: 'authored-source',
+          authoredTargetId: 'authored-target',
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.graph?.edges[0]).toMatchObject({
+      authoredSourceId: 'authored-source',
+      authoredTargetId: 'authored-target',
+    });
+  });
+
   it('warns for edge item mismatches without failing validation', () => {
     const result = validateProductionGraph(
       {

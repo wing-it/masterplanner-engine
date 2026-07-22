@@ -362,6 +362,82 @@ describe('allocateActualFlows', () => {
     expect(result.edges['source-c']?.allocation).toBeCloseTo(0, 5);
   });
 
+  it('ranks a consumer whose engine endpoint was rewritten, via its authored alias', () => {
+    // The app ranks the AUTHORED boundary port id; flattening rewrote the edge
+    // target to a `sink:` node, so only the alias can match.
+    const routing = { portSide: 'output' as const, portId: 'out', priority: ['out-port', 'packager'] };
+    const g = graph({
+      nodes: [
+        { kind: 'source', id: 'source', itemId: 'item', sourceType: 'manual-input', maxRatePerMin: 120 },
+        { kind: 'sink', id: 'sink:factory-1:out-port', itemId: 'item' },
+        { kind: 'sink', id: 'packager', itemId: 'item' },
+      ],
+      edges: [
+        {
+          id: 'source-export',
+          sourceId: 'source',
+          targetId: 'sink:factory-1:out-port',
+          itemId: 'item',
+          authoredTargetId: 'out-port',
+          routing,
+        },
+        { id: 'source-packager', sourceId: 'source', targetId: 'packager', itemId: 'item', routing },
+      ],
+    });
+    const required: RequiredPlan = {
+      source: requiredNode('source', {}, { item: 120 }),
+      'sink:factory-1:out-port': requiredNode('sink:factory-1:out-port', { item: 90 }),
+      packager: requiredNode('packager', { item: 90 }),
+    };
+    const actual: ActualPlan = {
+      source: actualNode('source', { item: 120 }),
+      'sink:factory-1:out-port': actualNode('sink:factory-1:out-port', {}),
+      packager: actualNode('packager', {}),
+    };
+
+    const result = allocateActualFlows(normalizeGraph(g), required, actual, gameData());
+
+    expect(deriveRoutingCoverage(g.edges)).toBe('full');
+    expect(result.edges['source-export']?.allocation).toBeCloseTo(90, 5);
+    expect(result.edges['source-packager']?.allocation).toBeCloseTo(30, 5);
+  });
+
+  it('serves every branch demand in full before splitting a divergent fork surplus', () => {
+    // Aluminum-ingot fan-out, 2026-07-22: an over-producing exporter split
+    // between a large and a tiny consumer must not equal-share the output —
+    // the big branch read 1665 of its 2060 (phantom shortage) while the small
+    // branch drowned in 1665 against a 61.5 demand.
+    const g = graph({
+      nodes: [
+        { kind: 'source', id: 'source', itemId: 'ingot', sourceType: 'manual-input', maxRatePerMin: 3780 },
+        { kind: 'recipe', id: 'big', recipeId: 'big-consumer' },
+        { kind: 'recipe', id: 'small', recipeId: 'small-consumer' },
+      ],
+      edges: [
+        { id: 'to-big', sourceId: 'source', targetId: 'big', itemId: 'ingot' },
+        { id: 'to-small', sourceId: 'source', targetId: 'small', itemId: 'ingot' },
+      ],
+    });
+    const required: RequiredPlan = {
+      source: requiredNode('source', {}, { ingot: 3780 }),
+      big: requiredNode('big', { ingot: 2060 }, { ficsite: 2060 }),
+      small: requiredNode('small', { ingot: 61.5 }, { packaged: 61.5 }),
+    };
+    const actual: ActualPlan = {
+      source: actualNode('source', { ingot: 3780 }),
+      big: actualNode('big', { ficsite: 2060 }),
+      small: actualNode('small', { packaged: 61.5 }),
+    };
+
+    const result = allocateActualFlows(normalizeGraph(g), required, actual, gameData([
+      recipe({ id: 'big-consumer', durationSeconds: 4, inputs: [{ itemId: 'ingot', amount: 1 }], outputs: [{ itemId: 'ficsite', amount: 1 }] }),
+      recipe({ id: 'small-consumer', durationSeconds: 4, inputs: [{ itemId: 'ingot', amount: 1 }], outputs: [{ itemId: 'packaged', amount: 1 }] }),
+    ]));
+
+    expect(result.edges['to-big']?.allocation).toBeGreaterThanOrEqual(2060 - 1e-5);
+    expect(result.edges['to-small']?.allocation).toBeGreaterThanOrEqual(61.5 - 1e-5);
+  });
+
   it('divides demand across same-item fan-in so a target is not double-counted', () => {
     const g = graph({
       nodes: [

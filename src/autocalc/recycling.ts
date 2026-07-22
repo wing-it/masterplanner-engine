@@ -6,6 +6,7 @@ import {
   ratesForMachines,
   resolveSomersloopMultiplier,
 } from '../graph/recipe-math';
+import { edgeIdentifiers, matchesIdentifier } from './edge-identity';
 import type { EngineGameData, EngineRecipeDefinition } from '../types/game-data';
 import type { ProductionEdge, ProductionNode } from '../types/production-graph';
 
@@ -110,16 +111,14 @@ function rankForEdge(edge: ProductionEdge, relevantEdges: readonly ProductionEdg
   const priority = edge.routing?.priority ?? [];
   if (priority.length === 0) return null;
 
-  const identifiers = [edge.id, edge.sourceId, edge.targetId];
+  const identifiers = edgeIdentifiers(edge);
   for (const identifier of identifiers) {
     const rank = priority.indexOf(identifier);
     if (rank >= 0) return rank;
   }
 
   for (const peerId of priority) {
-    const peerIndex = relevantEdges.findIndex((candidate) =>
-      candidate.id === peerId || candidate.sourceId === peerId || candidate.targetId === peerId
-    );
+    const peerIndex = relevantEdges.findIndex((candidate) => matchesIdentifier(candidate, peerId));
     if (peerIndex >= 0 && relevantEdges[peerIndex]?.id === edge.id) return priority.indexOf(peerId);
   }
 

@@ -91,6 +91,16 @@ export interface ProductionEdge {
   sourceId: NodeId;
   targetId: NodeId;
   itemId: ItemId;
+  /**
+   * Planner-authored endpoint ids this edge was flattened from — a boundary
+   * port or subfactory node whose id survives in `routing.priority` even
+   * though the engine endpoint was rewritten (e.g. to a `sink:` node or to the
+   * recipe on the far side of a factory link). `rankForEdge` matches priority
+   * entries against these in addition to id/sourceId/targetId. Aliasing aid
+   * only — never topology.
+   */
+  authoredSourceId?: string;
+  authoredTargetId?: string;
   routing?: {
     portSide: 'input' | 'output';
     portId: string;
@@ -181,6 +191,8 @@ export const productionEdgeSchema = z.object({
   sourceId: z.string().min(1),
   targetId: z.string().min(1),
   itemId: z.string().min(1),
+  authoredSourceId: z.string().min(1).optional(),
+  authoredTargetId: z.string().min(1).optional(),
   routing: z
     .object({
       portSide: z.enum(['input', 'output']),

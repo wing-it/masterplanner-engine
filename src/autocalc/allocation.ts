@@ -1,6 +1,7 @@
 import type { NormalizedGraph } from '../graph/normalize';
 import { findRecipe, itemsMatch, ratePerMachine } from '../graph/recipe-math';
 import { autoRankContestedFork } from './auto-priority';
+import { edgeIdentifiers, matchesIdentifier } from './edge-identity';
 import { classifyIncomingEdges, isFixedByproductEdge } from './recycling';
 import type { EngineGameData, EngineRecipeDefinition } from '../types/game-data';
 import type { NodeId, ProductionEdge, ProductionNode } from '../types/production-graph';
@@ -234,16 +235,14 @@ function rankForEdge(edge: ProductionEdge, relevantEdges: readonly ProductionEdg
     .find((priority) => priority.length > 0) ?? [];
   if (priorities.length === 0) return null;
 
-  const identifiers = [edge.id, edge.sourceId, edge.targetId];
+  const identifiers = edgeIdentifiers(edge);
   for (const identifier of identifiers) {
     const rank = priorities.indexOf(identifier);
     if (rank >= 0) return rank;
   }
 
   for (const peerId of priorities) {
-    const peerIndex = relevantEdges.findIndex((candidate) =>
-      candidate.id === peerId || candidate.sourceId === peerId || candidate.targetId === peerId
-    );
+    const peerIndex = relevantEdges.findIndex((candidate) => matchesIdentifier(candidate, peerId));
     if (peerIndex >= 0 && relevantEdges[peerIndex]?.id === edge.id) {
       return priorities.indexOf(peerId);
     }
@@ -486,6 +485,26 @@ function allocateRedistribute(params: {
         DEFAULT_EPSILON
       );
       for (const edgeId of floors.keys()) floors.set(edgeId, fill.get(edgeId) ?? 0);
+    }
+  }
+
+  // Surplus regime: when production covers every branch's demand, each demand
+  // is served IN FULL before any surplus is distributed. Without this, a
+  // divergent fork's unbounded equal-share split is demand-blind — an
+  // over-producing maximized exporter split between a 2060/min consumer and a
+  // 61.5/min consumer handed both branches 1665, starving the big consumer
+  // into a phantom shortage while drowning the small one (aluminum-ingot
+  // fan-out, 2026-07-22). Scarcity keeps the in-game merger equal-share
+  // semantics unchanged.
+  if (divergentFork) {
+    const branchDemands = params.itemEdges.map((edge) =>
+      getEdgeDemand(edge, params.normalized, params.requiredPlan, params.actualPlan, params.gameData)
+    );
+    const totalBranchDemand = branchDemands.reduce((sum, demand) => sum + demand, 0);
+    if (params.actualSupply >= totalBranchDemand - DEFAULT_EPSILON) {
+      params.itemEdges.forEach((edge, index) => {
+        floors.set(edge.id, Math.max(floors.get(edge.id) ?? 0, branchDemands[index]!));
+      });
     }
   }
 
